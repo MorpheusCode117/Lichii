@@ -1906,10 +1906,15 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
             fsr3_unsupported = true;
             return false;
         }
+        // The Xenoblade Switch 2 Editions give standard depth (far reads 1) and tonemapped colour:
+        // Ocarina of Time's profile, with unit exposure.
+        const bool ldr_profile = Settings::values.nx2_dlss_to_fsr;
         try {
-            fsr3_upscaler = std::make_unique<Fsr3Upscaler>(device, scheduler, memory_allocator,
-                                                           staging_buffer_pool, descriptor_pool,
-                                                           compute_pass_descriptor_queue);
+            fsr3_upscaler = std::make_unique<Fsr3Upscaler>(
+                device, scheduler, memory_allocator, staging_buffer_pool, descriptor_pool,
+                compute_pass_descriptor_queue,
+                ldr_profile ? Fsr3Upscaler::Profile::OcarinaLdr
+                            : Fsr3Upscaler::Profile::HdrReversedDepth);
         } catch (const vk::Exception& exception) {
             LOG_ERROR(Render_Vulkan, "FSR 3.1 failed to start ({}); using the temporal stand-in",
                       exception.what());
@@ -2062,6 +2067,9 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
             .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
                                     motion_scale[1] * static_cast<f32>(render_size[1])},
             .reset = reset,
+            // Xenoblade's depth is standard (far reads 1) and its colour tonemapped.
+            .depth_inverted = !Settings::values.nx2_dlss_to_fsr,
+            .hdr = !Settings::values.nx2_dlss_to_fsr,
         });
     } catch (const vk::Exception& exception) {
         LOG_WARNING(Render_Vulkan, "NVIDIA DLSS evaluation unavailable ({}); using FSR 3.1",
@@ -2132,8 +2140,12 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                         !same_size(motion_vectors))) {
         return false;
     }
-    if (use_history && depth && (!plain(*depth) || !fits(*depth, render_size) ||
-                                depth->format != PixelFormat::D32_FLOAT || !same_size(*depth))) {
+    // D32 with stencil (Xenoblade Chronicles 2) goes to FSR through its depth-only view.
+    if (use_history && depth &&
+        (!plain(*depth) || !fits(*depth, render_size) ||
+         (depth->format != PixelFormat::D32_FLOAT &&
+          depth->format != PixelFormat::D32_FLOAT_S8_UINT) ||
+         !same_size(*depth))) {
         return false;
     }
     if (use_history && depth && UpscaleWithFsr3(dst_framebuffer, input_color, motion_vectors, *depth, render_size,
@@ -5323,11 +5335,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
         });
         total += size;
     }
-    // Deferred, and stamped once the copy below is recorded. The decode submits (wait), so a
-    // buffer stamped now carried the tick before that submit while the encode and the copy ran
-    // in the next one: the pool could hand it to the next transcode, or free it, once the GPU
-    // was past the decode, and two textures' blocks met in one buffer.
-    auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal, true);
+    const auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal);
 
     const u64 layer_stride = info.layer_stride;
     const size_t guest_size = image.guest_size_bytes;
@@ -5351,13 +5359,10 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             ASTCDecoderPass::Target{
                 .image = *pending.image,
                 .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                // A later batch overwrites what the previous batch's encode read: its barrier
-                // waits for that (initialized).
+                // A later batch overwrites what the previous batch's encode read: wait for it.
                 .initialized = base != 0,
                 .level_view = [&pending](s32 level) { return *pending.views[level]; },
-                // Only the last batch submits. `map` carries this tick: a later batch reading it
-                // after a submit could find it freed, or refilled with the next upload.
-                .wait = base + count >= layers,
+                .wait = true,
                 .levels = levels,
             },
             batch_map, swizzles);
@@ -5379,7 +5384,6 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                                0, barrier);
     });
     image.UploadMemory(output.buffer, output.offset, copies);
-    staging_buffer_pool.FreeDeferred(output);
     pending.tick = scheduler.CurrentTick();
     pending_transcodes.push_back(std::move(pending));
 }
