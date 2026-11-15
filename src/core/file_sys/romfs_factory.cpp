@@ -134,14 +134,15 @@ VirtualFile RomFSFactory::OpenPatchedRomFSWithProgramIndex(u64 title_id, u8 prog
                                                            ContentRecordType type) const {
     const auto res_title_id = GetBaseTitleIDWithProgramIndex(title_id, program_index);
 
-    if (auto romfs = OpenPatchedRomFS(res_title_id, type); romfs != nullptr) {
-        return romfs;
-    }
+    // The running NUP's own sibling wins over an installed, possibly older, one.
     if (type == ContentRecordType::Program) {
         if (auto romfs = OpenBootContent(res_title_id, type)) {
             const PatchManager mods{res_title_id, filesystem_controller, content_provider};
             return mods.PatchRomFS(nullptr, std::move(romfs), type, nullptr);
         }
+    }
+    if (auto romfs = OpenPatchedRomFS(res_title_id, type); romfs != nullptr) {
+        return romfs;
     }
     if (program_index == 0 && !updatable) {
         // NUP containers and loose dumps aren't in the content provider: use the loader's RomFS.
